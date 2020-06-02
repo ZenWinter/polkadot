@@ -69,6 +69,8 @@ use futures::{
 };
 use futures_timer::Delay;
 use streamunordered::{StreamYield, StreamUnordered};
+use polkadot_primitives::Hash;
+use polkadot_statement_table::SignedStatement;
 
 /// An error type that describes faults that may happen
 ///
@@ -225,9 +227,9 @@ pub struct SubsystemContext<M: Debug>{
 #[derive(Debug)]
 pub enum OverseerSignal {
 	/// `Subsystem` should start working.
-	StartWork,
+	StartWork(Hash),
 	/// `Subsystem` should stop working.
-	StopWork,
+	StopWork(Hash),
 	/// Conclude the work of the `Overseer` and all `Subsystem`s.
 	Conclude,
 }
@@ -249,6 +251,16 @@ pub enum CandidateBackingSubsystemMessage {
 	Second,
 }
 
+
+#[derive(Debug)]
+/// A message type used by the StatementGossip [`Subsystem`].
+///
+/// [`Subsystem`]: trait.Subsystem.html
+pub enum StatementGossipSubsystemMessage {
+    ToGossip { relay_parent: Hash, statement: SignedStatement },
+    Received { relay_parent: Hash, statement: SignedStatement }
+}
+
 /// A message type tying together all message types that are used across [`Subsystem`]s.
 ///
 /// [`Subsystem`]: trait.Subsystem.html
@@ -256,6 +268,7 @@ pub enum CandidateBackingSubsystemMessage {
 pub enum AllMessages {
 	Validation(ValidationSubsystemMessage),
 	CandidateBacking(CandidateBackingSubsystemMessage),
+	StatementGossip(StatementGossipSubsystemMessage)
 }
 
 /// A message type that a [`Subsystem`] receives from the [`Overseer`].
@@ -354,6 +367,9 @@ pub struct Overseer<S: Spawn> {
 
 	/// A candidate backing subsystem
 	candidate_backing_subsystem: OverseenSubsystem<CandidateBackingSubsystemMessage>,
+
+	/// A statement gossip subsystem
+	statement_gossip_subsystem: OverseenSubsystem<StatementGossipSubsystemMessage>,
 
 	/// Spawner to spawn tasks to.
 	s: S,
@@ -473,6 +489,7 @@ where
 	pub fn new(
 		validation: Box<dyn Subsystem<ValidationSubsystemMessage> + Send>,
 		candidate_backing: Box<dyn Subsystem<CandidateBackingSubsystemMessage> + Send>,
+		statement_gossip: Box<dyn Subsystem<StatementGossipSubsystemMessage> + Send>,
 		mut s: S,
 	) -> SubsystemResult<(Self, OverseerHandler)> {
 		let (events_tx, events_rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -498,9 +515,17 @@ where
 			candidate_backing,
 		)?;
 
+		let statement_gossip_subsystem = spawn(
+			&mut s,
+			&mut running_subsystems,
+			&mut running_subsystems_rx,
+			statement_gossip,
+		)?;
+
 		let this = Self {
 			validation_subsystem,
 			candidate_backing_subsystem,
+			statement_gossip_subsystem,
 			s,
 			running_subsystems,
 			running_subsystems_rx,
@@ -585,6 +610,11 @@ where
 			}
 			AllMessages::CandidateBacking(msg) => {
 				if let Some(ref mut s) = self.candidate_backing_subsystem.instance {
+					let _ = s.tx.send(FromOverseer::Communication { msg }).await;
+				}
+			}
+			AllMessages::StatementGossip(msg) => {
+				if let Some(ref mut s) = self.statement_gossip_subsystem.instance {
 					let _ = s.tx.send(FromOverseer::Communication { msg }).await;
 				}
 			}
