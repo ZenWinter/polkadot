@@ -1,111 +1,134 @@
-use std::collections::HashSet;
-use std::time::Duration;
+// Copyright 2020 Parity Technologies (UK) Ltd.
+// This file is part of Polkadot.
 
-use futures::pending;
+// Polkadot is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// Polkadot is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
+
+//! Shows a basic usage of the `Overseer`:
+//!   * Spawning subsystems and subsystem child jobs
+//!   * Establishing message passing
+
+use std::time::Duration;
+use futures::{
+	pending, pin_mut, executor, select, stream,
+	FutureExt, StreamExt,
+};
 use futures_timer::Delay;
 use kv_log_macro as log;
 
-use overseer::{Overseer, Subsystem, SubsystemContext, SubsystemJob};
+use overseer::{
+	AllMessages, CandidateBackingSubsystemMessage, FromOverseer,
+	Overseer, Subsystem, SubsystemContext, SpawnedSubsystem, ValidationSubsystemMessage,
+};
 
 struct Subsystem1;
 
 impl Subsystem1 {
-	async fn run(mut ctx: SubsystemContext<usize>)  {
+	async fn run(mut ctx: SubsystemContext<CandidateBackingSubsystemMessage>)  {
 		loop {
 			match ctx.try_recv().await {
 				Ok(Some(msg)) => {
-					log::info!("Subsystem1 received message {}", msg);
+					if let FromOverseer::Communication { msg } = msg {
+						log::info!("msg {:?}", msg);
+					}
+					continue;
 				}
 				Ok(None) => (),
-				Err(_) => {}
+				Err(_) => {
+					log::info!("exiting");
+					return;
+				}
 			}
 
 			Delay::new(Duration::from_secs(1)).await;
-			ctx.send_msg(10).await;
-			pending!();
+			ctx.send_msg(AllMessages::Validation(
+				ValidationSubsystemMessage::ValidityAttestation
+			)).await.unwrap();
 		}
-	}
-
-	fn new() -> Self {
-		Self
 	}
 }
 
-impl Subsystem<usize> for Subsystem1 {
-	fn start(&mut self, ctx: SubsystemContext<usize>) -> SubsystemJob {
-		SubsystemJob(Box::pin(async move {
+impl Subsystem<CandidateBackingSubsystemMessage> for Subsystem1 {
+	fn start(&mut self, ctx: SubsystemContext<CandidateBackingSubsystemMessage>) -> SpawnedSubsystem {
+		SpawnedSubsystem(Box::pin(async move {
 			Self::run(ctx).await;
-			Ok(())
 		}))
 	}
 }
 
 struct Subsystem2;
 
-
 impl Subsystem2 {
-	async fn run(mut ctx: SubsystemContext<usize>)  {
-		let ss3 = Box::new(Subsystem3);
+	async fn run(mut ctx: SubsystemContext<ValidationSubsystemMessage>)  {
+		ctx.spawn(Box::pin(async {
+			loop {
+				log::info!("Job tick");
+				Delay::new(Duration::from_secs(1)).await;
+			}
+		})).await.unwrap();
 
-		let ss3_id = ctx.spawn(ss3).await;
-		log::info!("Received subsystem id {:?}", ss3_id);
 		loop {
 			match ctx.try_recv().await {
 				Ok(Some(msg)) => {
-					log::info!("Subsystem2 received message {}", msg);
+					log::info!("Subsystem2 received message {:?}", msg);
+					continue;
 				}
-				Ok(None) => (),
-				Err(_) => {}
+				Ok(None) => { pending!(); }
+				Err(_) => {
+					log::info!("exiting");
+					return;
+				},
 			}
-			pending!();
 		}
 	}
-
-	fn new() -> Self {
-		Self
-	}
 }
 
-impl Subsystem<usize> for Subsystem2 {
-	fn start(&mut self, ctx: SubsystemContext<usize>) -> SubsystemJob {
-		SubsystemJob(Box::pin(async move {
+impl Subsystem<ValidationSubsystemMessage> for Subsystem2 {
+	fn start(&mut self, ctx: SubsystemContext<ValidationSubsystemMessage>) -> SpawnedSubsystem {
+		SpawnedSubsystem(Box::pin(async move {
 			Self::run(ctx).await;
-			Ok(())
 		}))
 	}
-}
-
-struct Subsystem3;
-
-impl Subsystem<usize> for Subsystem3 {
-	fn start(&mut self, mut ctx: SubsystemContext<usize>) -> SubsystemJob {
-		SubsystemJob(Box::pin(async move {
-			// TODO: ctx actually has to be used otherwise the channels are dropped
-			loop {
-				// ignore all incoming msgs
-				while let Ok(Some(_)) = ctx.try_recv().await {
-				}
-				log::info!("Subsystem3 tick");
-				Delay::new(Duration::from_secs(1)).await;
-
-				pending!();
-			}
-		}))
-	}
-
-	fn can_recv_msg(&self, _msg: &usize) -> bool { false }
 }
 
 fn main() {
 	femme::with_level(femme::LevelFilter::Trace);
+	let spawner = executor::ThreadPool::new().unwrap();
 
 	futures::executor::block_on(async {
-		let subsystems: Vec<Box<dyn Subsystem<usize>>> = vec![
-			Box::new(Subsystem1::new()),
-			Box::new(Subsystem2::new()),
-		];
+		let timer_stream = stream::repeat(()).then(|_| async {
+			Delay::new(Duration::from_secs(1)).await;
+		});
 
-		let overseer = Overseer::new(subsystems);
-		overseer.run().await;
+		let (overseer, _handler) = Overseer::new(
+			Box::new(Subsystem2),
+			Box::new(Subsystem1),
+			spawner,
+		).unwrap();
+		let overseer_fut = overseer.run().fuse();
+		let timer_stream = timer_stream;
+
+		pin_mut!(timer_stream);
+		pin_mut!(overseer_fut);
+
+		loop {
+			select! {
+				_ = overseer_fut => break,
+				_ = timer_stream.next() => {
+					log::info!("tick");
+				}
+				complete => break,
+			}
+		}
 	});
 }
